@@ -26,11 +26,16 @@ This is a fork of [rhgndf/ms912x](https://github.com/rhgndf/ms912x) (branch `ker
 
 ## What this project can do
 
-- Drive the panel at its native **1024x600 @ 60 Hz** on Linux as a normal DRM/KMS display. It works under Wayland compositors (tested with Hyprland), X11, and the framebuffer console (`/dev/fbN`).
+- Drive the panel at its native **1024x600 @ 60 Hz** on Linux as a normal DRM/KMS display. Verified with direct framebuffer (`/dev/fbN`) and KMS (`modetest`) output. Use under a Wayland compositor (Hyprland) or X11 should work the same way as any other DRM output, but isn't yet confirmed.
 - Work over a single USB cable from either USB-C port on the monitor, on a plain USB-A or USB-C host port. No dock or DisplayPort Alt Mode is needed.
 - Survive hot-plugging: unplug and replug the monitor and it comes back.
 - Build as a DKMS module, so it rebuilds automatically on kernel updates.
-- Leave other ms912x devices (HDMI/VGA adapters) unaffected. The panel-specific behavior only applies when the chip reports an integrated digital panel, its flash has no timing, and its EDID asks for 1024x600.
+- Mostly leave other ms912x devices alone. Exactly what changes for them:
+  - The 1024x600 fallback timing is only added when the chip reports a digital (integrated) port, its flash has no custom timing, and its EDID asks for 1024x600.
+  - Digital-port devices with any custom timing are limited to those custom modes.
+  - The probe-time 720x480 reset is skipped for **all** digital-port devices.
+  - The 3 s boot delay applies to **all** `345f:*` devices (`9132`, `9133`, `9135`), including HDMI/VGA adapters with that vendor ID.
+  - The probe fails if the video-port register can't be read after one retry. Upstream would have carried on.
 
 ## What it can't do (yet)
 
@@ -39,7 +44,7 @@ This is a fork of [rhgndf/ms912x](https://github.com/rhgndf/ms912x) (branch `ker
 - **Limited frame rate.** Every frame is compressed to YUV 4:2:2 and pushed over USB 2.0. Fine for text, terminals and dashboards; video and fast motion will be choppy. The vendor quotes 25 FPS.
 - **Colors may look slightly washed out.** The driver sends limited-range (16-235) BT.601 YUV. The panel may expect full range. Not yet addressed.
 - **Only 1024x600.** Other timings leave the panel dark, so the driver doesn't offer them. Scale in your compositor if you need a different logical size.
-- **Tested only on** Arch Linux, kernel 7.2.15 (linux-surface), Surface Pro 6, Hyprland 0.57. Upstream has branches for other kernels (5.10-6.18), but this patch has only been applied to and tested on the `kernel-7.2` base.
+- **Tested only on** Arch Linux, kernel 7.2.15 (linux-surface), Surface Pro 6. The DKMS config refuses to build for kernels older than 7.2. Upstream has branches for other kernels (5.10-6.18), but this patch has only been applied to and tested on the `kernel-7.2` base.
 - **Suspend/resume** has code paths for it but hasn't been tested yet.
 - **Not in mainline.** It's an out-of-tree module. With Secure Boot enabled you must sign it yourself.
 - **Compositor hotplug.** A Wayland compositor that was already running when the module first loaded may grab the device without creating an output for it. Restart the compositor (log out and back in) once after installing.
@@ -50,8 +55,7 @@ This is a fork of [rhgndf/ms912x](https://github.com/rhgndf/ms912x) (branch `ker
 ```sh
 # Arch: sudo pacman -S dkms linux-headers   (or your kernel's -headers package)
 git clone https://github.com/maxDTM/lcdwiki-mpc7088-linux.git
-sudo cp -r lcdwiki-mpc7088-linux /usr/src/ms912x-0.1
-sudo dkms install ms912x/0.1
+sudo dkms install ./lcdwiki-mpc7088-linux     # copies to /usr/src/ms912x-0.1 and builds
 sudo modprobe ms912x
 ```
 
