@@ -54,7 +54,7 @@ static void ms912x_request_work(struct work_struct *work)
 	if (ret)
 		goto dev_exit;
 
-	mod_timer(&request->timer, jiffies + msecs_to_jiffies(5000));
+	mod_timer(&request->timer, jiffies + msecs_to_jiffies(MS912X_BULK_TIMEOUT_MS));
 	usb_sg_wait(sgr);
 
 	if (!timer_delete_sync(&request->timer))
@@ -67,9 +67,15 @@ static void ms912x_request_work(struct work_struct *work)
 dev_exit:
 	drm_dev_exit(idx);
 complete:
-	if (ret < 0 && ret != -ENODEV)
+	if (ret < 0 && ret != -ENODEV) {
 		drm_err_ratelimited(&ms912x->drm,
 				    "failed to send framebuffer: %d\n", ret);
+		if (atomic_inc_return(&ms912x->tx_failures) >=
+		    MS912X_MAX_TX_FAILURES)
+			ms912x_schedule_recovery(ms912x, "frame transfers failing");
+	} else if (ret >= 0) {
+		atomic_set(&ms912x->tx_failures, 0);
+	}
 	complete(&request->done);
 }
 
@@ -126,6 +132,29 @@ err_vfree:
 	return ret;
 }
 
+/*
+ * BT.601, 16.16 fixed point. Limited range (Y 16-235, C 16-240) suits HDMI/VGA
+ * adapters; integrated panels expect full range (0-255), otherwise black is
+ * grey and the picture looks washed out.
+ */
+static inline unsigned int ms912x_rgb_to_y_full(unsigned int r, unsigned int g,
+						unsigned int b)
+{
+	return (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+}
+
+static inline unsigned int ms912x_rgb_to_u_full(unsigned int r, unsigned int g,
+						unsigned int b)
+{
+	return ((128 << 16) - 11059 * r - 21709 * g + 32767 * b) >> 16;
+}
+
+static inline unsigned int ms912x_rgb_to_v_full(unsigned int r, unsigned int g,
+						unsigned int b)
+{
+	return ((128 << 16) + 32767 * r - 27439 * g - 5329 * b) >> 16;
+}
+
 static inline unsigned int ms912x_rgb_to_y(unsigned int r, unsigned int g,
 					   unsigned int b)
 {
@@ -153,7 +182,7 @@ static inline unsigned int ms912x_rgb_to_v(unsigned int r, unsigned int g,
 static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
 				       const struct iosys_map *xrgb_buffer,
 				       size_t offset, size_t width,
-				       __le32 *temp_buffer)
+				       __le32 *temp_buffer, bool full_range)
 {
 	unsigned int i, dst_offset = 0;
 	unsigned int pixel1, pixel2;
@@ -172,15 +201,21 @@ static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
 		g2 = (pixel2 >> 8) & 0xff;
 		b2 = pixel2 & 0xff;
 
-		y1 = ms912x_rgb_to_y(r1, g1, b1);
-		y2 = ms912x_rgb_to_y(r2, g2, b2);
-
-		v = (ms912x_rgb_to_v(r1, g1, b1) +
-		     ms912x_rgb_to_v(r2, g2, b2)) /
-		    2;
-		u = (ms912x_rgb_to_u(r1, g1, b1) +
-		     ms912x_rgb_to_u(r2, g2, b2)) /
-		    2;
+		if (full_range) {
+			y1 = ms912x_rgb_to_y_full(r1, g1, b1);
+			y2 = ms912x_rgb_to_y_full(r2, g2, b2);
+			v = (ms912x_rgb_to_v_full(r1, g1, b1) +
+			     ms912x_rgb_to_v_full(r2, g2, b2)) / 2;
+			u = (ms912x_rgb_to_u_full(r1, g1, b1) +
+			     ms912x_rgb_to_u_full(r2, g2, b2)) / 2;
+		} else {
+			y1 = ms912x_rgb_to_y(r1, g1, b1);
+			y2 = ms912x_rgb_to_y(r2, g2, b2);
+			v = (ms912x_rgb_to_v(r1, g1, b1) +
+			     ms912x_rgb_to_v(r2, g2, b2)) / 2;
+			u = (ms912x_rgb_to_u(r1, g1, b1) +
+			     ms912x_rgb_to_u(r2, g2, b2)) / 2;
+		}
 
 		transfer_buffer[dst_offset++] = u;
 		transfer_buffer[dst_offset++] = y1;
@@ -226,7 +261,8 @@ static int ms912x_fb_xrgb8888_to_yuv422(void *dst,
 	fb_map = IOSYS_MAP_INIT_OFFSET(src, y1 * fb->pitches[0]);
 	for (i = y1; i < y2; i++) {
 		ms912x_xrgb_to_yuv422_line(dst, &fb_map, x * 4, width,
-					   temp_buffer);
+					   temp_buffer,
+					   to_ms912x(fb->dev)->full_range);
 		iosys_map_incr(&fb_map, fb->pitches[0]);
 		dst += width * 2;
 	}
@@ -252,12 +288,21 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 	rect->x2 = x + width;
 	current_request = &ms912x->requests[ms912x->current_request];
 
+	if (iosys_map_is_null(map))
+		return -EINVAL;
+
 	if (!drm_dev_enter(drm, &idx))
 		return -ENODEV;
 
-	/* Transfer buffer still in use, drop this frame. */
+	/*
+	 * Wait for the buffer used two frames ago. This paces the compositor to
+	 * what USB can carry (the commit, and so the page-flip event, completes
+	 * only once a buffer is free) instead of dropping frames, which could
+	 * leave the last update unsent. Conversion of this frame overlaps the
+	 * transfer of the previous one.
+	 */
 	if (!wait_for_completion_timeout(&current_request->done,
-					 msecs_to_jiffies(10))) {
+					 msecs_to_jiffies(MS912X_BULK_TIMEOUT_MS))) {
 		ret = -ETIMEDOUT;
 		goto dev_exit;
 	}

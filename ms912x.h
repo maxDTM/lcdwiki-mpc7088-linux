@@ -127,6 +127,13 @@ struct ms912x_device {
 
 	struct drm_rect update_rect;
 
+	/* Convert to full-range (0-255) YUV instead of limited (16-235) */
+	bool full_range;
+
+	/* Recovery from a wedged chip: consecutive transfer failures */
+	atomic_t tx_failures;
+	unsigned long recovery_requested;
+
 	/* Double buffer to allow memcpy and transfer
 	 * to happen in parallel
 	 */
@@ -188,6 +195,18 @@ struct ms912x_custom_timing_record {
 } __packed;
 
 #define MS912X_FRAME_OVERHEAD 16
+
+/* Control requests are tiny; a responsive chip answers in microseconds */
+#define MS912X_CTRL_TIMEOUT_MS	1000
+/* A full 1024x600 UYVY frame is ~1.2 MB, ~35 ms at USB 2.0 speed */
+#define MS912X_BULK_TIMEOUT_MS	1000
+/* Reset the device after this many consecutive failed frame transfers */
+#define MS912X_MAX_TX_FAILURES	3
+/* ...but not more often than this */
+#define MS912X_RESET_INTERVAL_MS	30000
+#define MS912X_MAX_RESETS	3
+#define MS912X_RESET_WINDOW_MS	(5 * 60 * 1000)
+#define MS912X_RECOVERY_PENDING_MS	10000
 #define MS912X_MAX_WIDTH 1920
 #define MS912X_MAX_HEIGHT 1200
 #define MS912X_MAX_TRANSFER_LEN \
@@ -205,6 +224,7 @@ int ms912x_set_resolution(struct ms912x_device *ms912x,
 int ms912x_power_on(struct ms912x_device *ms912x);
 int ms912x_power_off(struct ms912x_device *ms912x);
 
+void ms912x_schedule_recovery(struct ms912x_device *ms912x, const char *why);
 int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 			struct drm_format_conv_state *fmtcnv_state,
 			struct drm_rect *rect);

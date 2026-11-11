@@ -6,6 +6,7 @@
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/pm.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
@@ -55,6 +56,9 @@ static bool ms912x_needs_boot_delay(struct usb_interface *interface)
 	       0x345f;
 }
 
+/* jiffies of the last recovery reset (module-wide, survives the re-probe) */
+static unsigned long ms912x_last_reset;
+
 /*
  * Integrated-panel units boot their own firmware right after power-up.
  * Commands sent in that window leave the panel output dead (LED red) until
@@ -70,6 +74,68 @@ static void ms912x_wait_for_boot(struct usb_interface *interface,
 		msleep(jiffies_to_msecs(delay - elapsed));
 }
 
+static int full_range = -1;
+module_param(full_range, int, 0444);
+MODULE_PARM_DESC(full_range,
+		 "YUV range: -1 auto (full for integrated panels, limited otherwise), 0 limited, 1 full");
+
+/*
+ * The chip can stop accepting frames (bulk transfers time out) and stays that
+ * way until it is re-enumerated. Recover with a USB reset. The driver has no
+ * pre/post_reset handlers on purpose: the reset unbinds and re-probes it, so
+ * the DRM device is torn down and recreated cleanly and the compositor sees a
+ * plain hotplug. (Parking/restoring the display with the suspend/resume
+ * helpers is unsafe here: userspace keeps committing during the reset.)
+ */
+/*
+ * Module-wide limits (a reset re-probes the device, so per-device state would
+ * not survive it): at most one reset per MS912X_RESET_INTERVAL_MS, and stop
+ * after MS912X_MAX_RESETS within MS912X_RESET_WINDOW_MS so a dead chip
+ * cannot cause a reset loop.
+ */
+static DEFINE_SPINLOCK(ms912x_reset_lock);
+static unsigned long ms912x_window_start;
+static unsigned int ms912x_resets_in_window;
+
+void ms912x_schedule_recovery(struct ms912x_device *ms912x, const char *why)
+{
+	unsigned long now = jiffies;
+	bool do_reset = false;
+
+	/* One request per device at a time; expires in case the reset never ran */
+	if (ms912x->recovery_requested &&
+	    time_before(now, ms912x->recovery_requested +
+				     msecs_to_jiffies(MS912X_RECOVERY_PENDING_MS)))
+		return;
+	ms912x->recovery_requested = now ? now : 1;
+
+	spin_lock(&ms912x_reset_lock);
+	if (!ms912x_window_start ||
+	    time_after(now, ms912x_window_start +
+				    msecs_to_jiffies(MS912X_RESET_WINDOW_MS))) {
+		ms912x_window_start = now;
+		ms912x_resets_in_window = 0;
+	}
+	if ((!ms912x_last_reset ||
+	     time_after(now, ms912x_last_reset +
+				     msecs_to_jiffies(MS912X_RESET_INTERVAL_MS))) &&
+	    ms912x_resets_in_window < MS912X_MAX_RESETS) {
+		ms912x_last_reset = now;
+		ms912x_resets_in_window++;
+		do_reset = true;
+	}
+	spin_unlock(&ms912x_reset_lock);
+
+	if (!do_reset) {
+		drm_err_once(&ms912x->drm,
+			     "%s; reset limit reached, replug the display\n", why);
+		return;
+	}
+
+	drm_warn(&ms912x->drm, "%s, resetting device\n", why);
+	usb_queue_reset_device(ms912x->intf);
+}
+
 /* The device lost power (or was reset) while suspended: chip rebooted. */
 static int ms912x_usb_reset_resume(struct usb_interface *interface)
 {
@@ -81,7 +147,7 @@ static int ms912x_usb_reset_resume(struct usb_interface *interface)
 
 DEFINE_DRM_GEM_FOPS(ms912x_driver_fops);
 
-static const struct drm_driver ms912x_drm_driver = {
+static struct drm_driver ms912x_drm_driver = {
 	.driver_features = DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
 
 	/* GEM hooks */
@@ -181,6 +247,7 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
 	ret = ms912x_power_on(ms912x);
 	if (ret) {
 		drm_err(dev, "failed to power on display: %d\n", ret);
+		ms912x_schedule_recovery(ms912x, "power on failed");
 		return;
 	}
 
@@ -191,8 +258,10 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 
 	ret = ms912x_set_resolution(ms912x, ms_mode);
-	if (ret)
+	if (ret) {
 		drm_err(dev, "failed to set display mode: %d\n", ret);
+		ms912x_schedule_recovery(ms912x, "mode set failed");
+	}
 }
 
 static void ms912x_cancel_transfer_work(struct ms912x_device *ms912x)
@@ -357,6 +426,17 @@ static const u8 ms912x_bulk_out_endpoints[] = {
 	MS912X_BULK_OUT_ENDPOINT, 0
 };
 
+/*
+ * Wayland compositors built on aquamarine (Hyprland) only accept render-less
+ * KMS devices when the DRM driver is DisplayLink's "evdi"; any other name makes
+ * them try to create an EGL renderer on the device, fail, and never light the
+ * output. Opt-in: report "evdi" so they use their display-only path instead.
+ */
+static bool aq_evdi_compat;
+module_param(aq_evdi_compat, bool, 0444);
+MODULE_PARM_DESC(aq_evdi_compat,
+		 "Report DRM driver name \"evdi\" so aquamarine/Hyprland drive the display (default off)");
+
 static int ms912x_usb_probe(struct usb_interface *interface,
 			    const struct usb_device_id *id)
 {
@@ -368,6 +448,9 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	struct usb_device *usbdev;
 	bool is_panel;
 	int port;
+
+	if (aq_evdi_compat)
+		ms912x_drm_driver.name = "evdi";
 
 	ms912x = devm_drm_dev_alloc(&interface->dev, &ms912x_drm_driver,
 				    struct ms912x_device, drm);
@@ -382,19 +465,32 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	if (!usb_check_bulk_endpoints(interface, ms912x_bulk_out_endpoints))
 		return -ENXIO;
 
-	ms912x_wait_for_boot(interface,
-			     interface_to_usbdev(interface)->connect_time);
+	{
+		/* A recovery reset may reboot the chip too: wait from whichever is later */
+		unsigned long since = interface_to_usbdev(interface)->connect_time;
+		unsigned long reset = READ_ONCE(ms912x_last_reset);
 
-	ret = ms912x_read_custom_timing(ms912x);
+		if (reset && time_after(reset, since))
+			since = reset;
+		ms912x_wait_for_boot(interface, since);
+	}
+
+	for (i = 0; i < 3; i++) {
+		ret = ms912x_read_custom_timing(ms912x);
+		if (ret != -EPROTO && ret != -ETIMEDOUT && ret != -EPIPE)
+			break;
+		msleep(200);
+	}
 	if (ret < 0) {
 		drm_warn(&ms912x->drm,
 			 "failed to read custom timing: %d\n", ret);
 	}
 
-	port = ms912x_read_byte(ms912x, MS912X_REG_VIDEO_PORT);
-	if (port < 0) {
-		msleep(100);
+	for (i = 0; i < 3; i++) {
 		port = ms912x_read_byte(ms912x, MS912X_REG_VIDEO_PORT);
+		if (port >= 0 || port == -ENODEV)
+			break;
+		msleep(200);
 	}
 	if (port < 0)
 		return port;
@@ -406,6 +502,7 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 				 "failed to add panel fallback timing: %d\n", ret);
 		ms912x->panel_only = ms912x->num_custom_modes > 0;
 	}
+	ms912x->full_range = full_range < 0 ? is_panel : full_range != 0;
 	for (i = 0; i < ms912x->num_custom_modes; i++) {
 		const struct ms912x_mode *mode = &ms912x->custom_modes[i].mode;
 
