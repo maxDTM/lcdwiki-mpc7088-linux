@@ -8,6 +8,7 @@
 
 #include <drm/drm_drv.h>
 #include <drm/drm_modes.h>
+#include <drm/drm_print.h>
 
 #include "ms912x.h"
 
@@ -259,6 +260,52 @@ int ms912x_read_custom_timing(struct ms912x_device *ms912x)
 	}
 
 	return ms912x->num_custom_modes ? ms912x->num_custom_modes : error;
+}
+
+/*
+ * Some integrated-panel units (video port DIGITAL) ship with blank flash and
+ * rely on the vendor Windows driver's config.ini for the panel timing. The
+ * chip has this 1024x600 timing built in as code 0x96 (verified by reading
+ * back 0xf398.. after selecting it). Only used when the EDID asks for it.
+ */
+int ms912x_add_panel_fallback_timing(struct ms912x_device *ms912x)
+{
+	static const struct ms912x_custom_timing_record rec_1024x600 = {
+		.vic = 0x96,
+		.polarity = MS912X_TIMING_PROGRESSIVE |
+			    MS912X_TIMING_POSITIVE_HSYNC |
+			    MS912X_TIMING_POSITIVE_VSYNC,
+		.htotal = cpu_to_le16(1344), .vtotal = cpu_to_le16(635),
+		.hactive = cpu_to_le16(1024), .vactive = cpu_to_le16(600),
+		.pixclk = cpu_to_le16(5121), .vfreq = cpu_to_le16(6000),
+		.hoffset = cpu_to_le16(160), .voffset = cpu_to_le16(23),
+		.hsyncwidth = cpu_to_le16(40), .vsyncwidth = cpu_to_le16(5),
+	};
+	u8 dtd[8];
+	unsigned int i, hact, vact;
+	int ret;
+
+	if (ms912x->num_custom_modes)
+		return 0;
+
+	/* First detailed timing descriptor of the EDID starts at byte 0x36 */
+	for (i = 0; i < sizeof(dtd); i++) {
+		ret = ms912x_read_byte(ms912x, MS912X_REG_EDID_BASE + 0x36 + i);
+		if (ret < 0)
+			return ret;
+		dtd[i] = ret;
+	}
+	hact = dtd[2] | ((dtd[4] & 0xf0) << 4);
+	vact = dtd[5] | ((dtd[7] & 0xf0) << 4);
+	if (hact != 1024 || vact != 600)
+		return 0;
+
+	ret = ms912x_decode_custom_timing(&ms912x->custom_modes[0],
+					  &rec_1024x600);
+	if (ret)
+		return ret;
+	ms912x->num_custom_modes = 1;
+	return 1;
 }
 
 static int ms912x_write_6_bytes(struct ms912x_device *ms912x,

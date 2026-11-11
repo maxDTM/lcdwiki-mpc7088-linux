@@ -178,6 +178,9 @@ static int ms912x_connector_get_modes(struct drm_connector *connector)
 	const struct drm_edid *edid;
 	int ret = ms912x_add_custom_mode(connector);
 
+	if (ms912x->panel_only)
+		return ret;
+
 	if (ms912x->port_type == MS912X_VIDEO_PORT_CVBS ||
 	    ms912x->port_type == MS912X_VIDEO_PORT_SVIDEO ||
 	    ms912x->port_type == MS912X_VIDEO_PORT_CVBS_SVIDEO ||

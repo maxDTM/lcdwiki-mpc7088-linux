@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -39,6 +41,41 @@ static int ms912x_usb_resume(struct usb_interface *interface)
 {
 	struct ms912x_device *ms912x = usb_get_intfdata(interface);
 
+	return drm_mode_config_helper_resume(&ms912x->drm);
+}
+
+static unsigned int boot_delay_ms = 3000;
+module_param(boot_delay_ms, uint, 0644);
+MODULE_PARM_DESC(boot_delay_ms,
+		 "345f:* integrated panels: ms to wait after power-up before talking to the chip (default 3000, max 10000)");
+
+static bool ms912x_needs_boot_delay(struct usb_interface *interface)
+{
+	return le16_to_cpu(interface_to_usbdev(interface)->descriptor.idVendor) ==
+	       0x345f;
+}
+
+/*
+ * Integrated-panel units boot their own firmware right after power-up.
+ * Commands sent in that window leave the panel output dead (LED red) until
+ * the next power cycle, so wait until the chip has settled.
+ */
+static void ms912x_wait_for_boot(struct usb_interface *interface,
+				 unsigned long since)
+{
+	unsigned long delay = msecs_to_jiffies(min(boot_delay_ms, 10000U));
+	unsigned long elapsed = jiffies - since;
+
+	if (ms912x_needs_boot_delay(interface) && elapsed < delay)
+		msleep(jiffies_to_msecs(delay - elapsed));
+}
+
+/* The device lost power (or was reset) while suspended: chip rebooted. */
+static int ms912x_usb_reset_resume(struct usb_interface *interface)
+{
+	struct ms912x_device *ms912x = usb_get_intfdata(interface);
+
+	ms912x_wait_for_boot(interface, jiffies);
 	return drm_mode_config_helper_resume(&ms912x->drm);
 }
 
@@ -117,6 +154,9 @@ ms912x_get_mode(struct ms912x_device *ms912x,
 		    custom_mode->hz == hz)
 			return custom_mode;
 	}
+
+	if (ms912x->panel_only)
+		return NULL;
 
 	for (i = 0; i < ARRAY_SIZE(ms912x_mode_list); i++) {
 		if (ms912x_mode_list[i].width == width &&
@@ -326,6 +366,8 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	struct drm_device *dev;
 	struct device *dma_dev;
 	struct usb_device *usbdev;
+	bool is_panel;
+	int port;
 
 	ms912x = devm_drm_dev_alloc(&interface->dev, &ms912x_drm_driver,
 				    struct ms912x_device, drm);
@@ -340,10 +382,29 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	if (!usb_check_bulk_endpoints(interface, ms912x_bulk_out_endpoints))
 		return -ENXIO;
 
+	ms912x_wait_for_boot(interface,
+			     interface_to_usbdev(interface)->connect_time);
+
 	ret = ms912x_read_custom_timing(ms912x);
 	if (ret < 0) {
 		drm_warn(&ms912x->drm,
 			 "failed to read custom timing: %d\n", ret);
+	}
+
+	port = ms912x_read_byte(ms912x, MS912X_REG_VIDEO_PORT);
+	if (port < 0) {
+		msleep(100);
+		port = ms912x_read_byte(ms912x, MS912X_REG_VIDEO_PORT);
+	}
+	if (port < 0)
+		return port;
+	is_panel = port == MS912X_VIDEO_PORT_DIGITAL;
+	if (is_panel) {
+		ret = ms912x_add_panel_fallback_timing(ms912x);
+		if (ret < 0)
+			drm_warn(&ms912x->drm,
+				 "failed to add panel fallback timing: %d\n", ret);
+		ms912x->panel_only = ms912x->num_custom_modes > 0;
 	}
 	for (i = 0; i < ms912x->num_custom_modes; i++) {
 		const struct ms912x_mode *mode = &ms912x->custom_modes[i].mode;
@@ -377,10 +438,15 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	dev->mode_config.funcs = &ms912x_mode_config_funcs;
 	dev->mode_config.helper_private = &ms912x_mode_config_helper_funcs;
 
-	/* This stops weird behavior in the device */
-	ret = ms912x_set_resolution(ms912x, &ms912x_mode_list[0]);
-	if (ret)
-		return ret;
+	/*
+	 * This stops weird behavior in the device. Integrated panels cannot
+	 * display 720x480 and never recover from it, so skip it for them.
+	 */
+	if (!is_panel) {
+		ret = ms912x_set_resolution(ms912x, &ms912x_mode_list[0]);
+		if (ret)
+			return ret;
+	}
 
 	ms912x->workqueue =
 		drmm_alloc_ordered_workqueue(dev, DRIVER_NAME, 0);
@@ -479,7 +545,7 @@ static struct usb_driver ms912x_driver = {
 	.disconnect = ms912x_usb_disconnect,
 	.suspend = ms912x_usb_suspend,
 	.resume = ms912x_usb_resume,
-	.reset_resume = ms912x_usb_resume,
+	.reset_resume = ms912x_usb_reset_resume,
 	.shutdown = ms912x_usb_shutdown,
 	.id_table = id_table,
 };

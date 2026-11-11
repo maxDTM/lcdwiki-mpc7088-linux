@@ -122,6 +122,8 @@ struct ms912x_device {
 
 	struct ms912x_custom_mode custom_modes[2];
 	unsigned int num_custom_modes;
+	/* Integrated panel: only the panel's own timing is usable */
+	bool panel_only;
 
 	struct drm_rect update_rect;
 
@@ -195,6 +197,7 @@ struct ms912x_custom_timing_record {
 
 int ms912x_read_byte(struct ms912x_device *ms912x, u16 address);
 int ms912x_read_custom_timing(struct ms912x_device *ms912x);
+int ms912x_add_panel_fallback_timing(struct ms912x_device *ms912x);
 int ms912x_connector_init(struct ms912x_device *ms912x);
 int ms912x_set_resolution(struct ms912x_device *ms912x,
 			  const struct ms912x_mode *mode);
