@@ -3,6 +3,7 @@
 #include <asm/byteorder.h>
 #include <linux/align.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/container_of.h>
 #include <linux/dma-direction.h>
 #include <linux/iosys-map.h>
@@ -65,17 +66,23 @@ static void ms912x_request_work(struct work_struct *work)
 		ret = -EIO;
 
 dev_exit:
-	drm_dev_exit(idx);
-complete:
-	if (ret < 0 && ret != -ENODEV) {
+	switch (ret) {
+	case 0:
+		atomic_set(&ms912x->tx_failures, 0);
+		break;
+	case -ENODEV:		/* unplugged */
+	case -ESHUTDOWN:	/* host controller or port going away */
+	case -ENOENT:		/* killed by usb core (unbind, reset) */
+		break;
+	default:
 		drm_err_ratelimited(&ms912x->drm,
 				    "failed to send framebuffer: %d\n", ret);
 		if (atomic_inc_return(&ms912x->tx_failures) >=
 		    MS912X_MAX_TX_FAILURES)
 			ms912x_schedule_recovery(ms912x, "frame transfers failing");
-	} else if (ret >= 0) {
-		atomic_set(&ms912x->tx_failures, 0);
 	}
+	drm_dev_exit(idx);
+complete:
 	complete(&request->done);
 }
 
@@ -102,6 +109,8 @@ int ms912x_init_request(struct ms912x_device *ms912x,
 	data = vmalloc_32(len);
 	if (!data)
 		return -ENOMEM;
+	/* Never let stale kernel memory reach the device */
+	memset(data, 0, len);
 
 	num_pages = DIV_ROUND_UP(len, PAGE_SIZE);
 	pages = kmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
@@ -189,6 +198,8 @@ static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
 	unsigned int r1, g1, b1, r2, g2, b2;
 	unsigned int v, y1, u, y2;
 
+	/* Callers pass an even width; never read past the temp buffer anyway */
+	width &= ~1;
 	iosys_map_memcpy_from(temp_buffer, xrgb_buffer, offset, width * 4);
 	for (i = 0; i < width; i += 2) {
 		pixel1 = le32_to_cpup(&temp_buffer[i]);
@@ -239,13 +250,14 @@ static int ms912x_fb_xrgb8888_to_yuv422(void *dst,
 	int i, x, y1, y2, width;
 	__le32 *temp_buffer;
 
+	/* ms912x_fb_send_rect clipped rect to the framebuffer */
 	y1 = rect->y1;
-	y2 = min_t(unsigned int, rect->y2, fb->height);
+	y2 = rect->y2;
 	x = rect->x1;
 	width = drm_rect_width(rect);
 
 	temp_buffer = drm_format_conv_state_reserve(fmtcnv_state,
-						    width * sizeof(*temp_buffer),
+						    ALIGN(width, 2) * sizeof(*temp_buffer),
 						    GFP_KERNEL);
 	if (!temp_buffer)
 		return -ENOMEM;
@@ -279,17 +291,36 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
 	struct ms912x_device *ms912x = to_ms912x(fb->dev);
 	struct drm_device *drm = &ms912x->drm;
 	struct ms912x_usb_request *current_request;
+	struct drm_rect clip;
 	int x, width;
 
-	/* UYVY stores pixels in pairs. Expand damage to a complete pair. */
+	if (iosys_map_is_null(map))
+		return -EINVAL;
+
+	/*
+	 * Only send pixels that exist in this framebuffer: the rect may carry
+	 * damage merged from an earlier frame. The device takes pixel pairs
+	 * (UYVY), so expand to whole pairs within an even-width framebuffer.
+	 */
+	drm_rect_init(&clip, 0, 0, ALIGN_DOWN(fb->width, 2), fb->height);
+	if (!drm_rect_intersect(rect, &clip))
+		return 0;
 	x = ALIGN_DOWN(rect->x1, 2);
-	width = min_t(int, ALIGN(rect->x2, 2), fb->width) - x;
+	width = min_t(int, ALIGN(rect->x2, 2), clip.x2) - x;
 	rect->x1 = x;
 	rect->x2 = x + width;
 	current_request = &ms912x->requests[ms912x->current_request];
 
-	if (iosys_map_is_null(map))
-		return -EINVAL;
+	/*
+	 * The device is failing and no reset is allowed yet: drop the frame
+	 * instead of blocking the commit for the full timeout. -EBUSY keeps
+	 * the damage, so the first frame afterwards repaints it.
+	 */
+	if (ms912x_dropping_frames(ms912x)) {
+		/* No vblank: pace the flip events so the compositor can't spin */
+		msleep(16);
+		return -EBUSY;
+	}
 
 	if (!drm_dev_enter(drm, &idx))
 		return -ENODEV;

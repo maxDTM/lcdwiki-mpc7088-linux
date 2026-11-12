@@ -30,7 +30,7 @@ This is a fork of [rhgndf/ms912x](https://github.com/rhgndf/ms912x) (branch `ker
 - Work over a single USB cable from either USB-C port on the monitor. Tested on the host's own USB port and through a Surface Dock. No DisplayPort Alt Mode is needed.
 - Survive hot-plugging and suspend/resume: tested under Hyprland with unplug and replug and `systemctl suspend`. After DPMS off/on the display was working again, though the blanking itself wasn't watched.
 - **Pace the compositor to USB speed.** The page-flip completes only when a transfer buffer is free (waiting up to 1 s), so the compositor isn't driven faster than USB 2.0 can carry frames. Upstream dropped any frame that found both buffers busy, which could leave the last update unsent. Now a frame is only lost if a transfer times out, and then the damage is resent with the next update.
-- **Recover from a wedged chip.** After 3 consecutive failed frame transfers, or a failed power-on or mode set, the driver resets the USB device. That unbinds and re-probes it, so the compositor sees an ordinary hotplug. Resets are limited to 1 per 30 s and 3 per 5 min. Tested with a forced reset under Hyprland.
+- **Recover from a wedged chip.** After 3 consecutive failed frame transfers, or a failed power-on or mode set, the driver resets the USB device. That unbinds and re-probes it, so the compositor sees an ordinary hotplug. Resets are limited to 1 per 30 s and 3 per 5 min, counted per device. While no reset is allowed, frames are dropped instead of stalling the compositor, and the screen is repainted once the device answers again. Tested with a forced reset under Hyprland.
 - **Full-range color** on integrated panels. Limited-range YUV made black grey and the picture washed out.
 - Build as a DKMS module, so it rebuilds automatically on kernel updates.
 - Mostly leave other ms912x devices alone. Exactly what changes for them:
@@ -66,7 +66,7 @@ echo 'options ms912x aq_evdi_compat=1' | sudo tee /etc/modprobe.d/ms912x.conf
 sudo modprobe ms912x
 ```
 
-Then plug in the monitor. After about 3 seconds the LED turns green and a new output appears. In `/sys/class/drm` it shows up as `card*-DPI-1`, and in `modetest -M ms912x -c`.
+Then plug in the monitor. After about 3 seconds the LED turns green and a new output appears. In `/sys/class/drm` it shows up as `card*-DPI-N`, and in `modetest -M ms912x -c` (`-M evdi` with `aq_evdi_compat=1`). The number is usually 1, but the kernel numbers connectors globally, so after a replug or reset it can come back as `DPI-2` and so on. Match `DPI-*` in compositor configs rather than `DPI-1`.
 
 To quickly test without installing:
 
@@ -80,10 +80,14 @@ sudo insmod ms912x.ko
 ```ini
 # hyprland.conf: adjust the position to your layout. Scale 4/3 (768x450 logical) makes text
 # more readable; 1024x600 only divides cleanly at a few scales (1, 4/3, 1.6, 2).
+# The connector can come back as DPI-2, DPI-3, ... after a replug: repeat the line for those,
+# or (Lua config) pick whichever DPI-* output exists.
 monitor = DPI-1, 1024x600@60, 3840x0, 1.333333
 # portrait, USB-C side up:
 # monitor = DPI-1, 1024x600@60, 3840x0, 1.333333, transform, 1
 ```
+
+Its EDID isn't readable by aquamarine, so `desc:` selectors don't work for it. To keep a fixed set of windows on the panel (a status screen, say), give it its own named workspace, e.g. `workspace = name:panel, monitor:DPI-1, default:true, persistent:true`, and leave it out of any scripts that switch every monitor together.
 
 ### Module parameters
 

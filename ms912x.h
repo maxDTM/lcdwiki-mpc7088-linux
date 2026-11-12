@@ -5,6 +5,7 @@
 
 #include <linux/bits.h>
 #include <linux/completion.h>
+#include <linux/jiffies.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/timer_types.h>
@@ -132,7 +133,13 @@ struct ms912x_device {
 
 	/* Recovery from a wedged chip: consecutive transfer failures */
 	atomic_t tx_failures;
-	unsigned long recovery_requested;
+	/* Reset budget, kept on the usb_device so it survives the re-probe */
+	struct ms912x_reset_state *reset_state;
+	/* While no reset is allowed, drop frames instead of blocking (jiffies) */
+	unsigned long drop_until;
+
+	/* Interface that takes the HID control requests (interface 0 normally) */
+	u16 ctrl_ifnum;
 
 	/* Double buffer to allow memcpy and transfer
 	 * to happen in parallel
@@ -207,6 +214,8 @@ struct ms912x_custom_timing_record {
 #define MS912X_MAX_RESETS	3
 #define MS912X_RESET_WINDOW_MS	(5 * 60 * 1000)
 #define MS912X_RECOVERY_PENDING_MS	10000
+/* EDID blocks read from the chip (base + extensions); the rest read as empty */
+#define MS912X_MAX_EDID_BLOCKS	4
 #define MS912X_MAX_WIDTH 1920
 #define MS912X_MAX_HEIGHT 1200
 #define MS912X_MAX_TRANSFER_LEN \
@@ -223,6 +232,20 @@ int ms912x_set_resolution(struct ms912x_device *ms912x,
 
 int ms912x_power_on(struct ms912x_device *ms912x);
 int ms912x_power_off(struct ms912x_device *ms912x);
+
+/* Device failing and no reset allowed yet (see ms912x_schedule_recovery) */
+static inline bool ms912x_dropping_frames(struct ms912x_device *ms912x)
+{
+	unsigned long until = READ_ONCE(ms912x->drop_until);
+
+	if (!until)
+		return false;
+	if (time_before(jiffies, until))
+		return true;
+	/* Expired: forget it, so a stale stamp can't look like the future */
+	WRITE_ONCE(ms912x->drop_until, 0);
+	return false;
+}
 
 void ms912x_schedule_recovery(struct ms912x_device *ms912x, const char *why);
 int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,

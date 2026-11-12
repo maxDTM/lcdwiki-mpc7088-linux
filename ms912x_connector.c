@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/array_size.h>
+#include <linux/string.h>
 
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_connector.h>
@@ -76,9 +77,21 @@ ms912x_get_encoder_type(enum ms912x_video_port port_type)
 static int ms912x_read_edid(void *data, u8 *buf, unsigned int block, size_t len)
 {
 	struct ms912x_device *ms912x = data;
-	int offset = block * EDID_LENGTH;
+	unsigned int offset = block * EDID_LENGTH;
 	unsigned int i;
 	int ret;
+
+	/*
+	 * Each byte is two control transfers made under mode_config.mutex, and
+	 * the extension count comes from the device. Don't read blocks past
+	 * the first few: fill them with 0xff, which fails the checksum, so the
+	 * EDID core drops them while keeping the rest. A bogus count then
+	 * can't stall probing or wrap the 16-bit register address.
+	 */
+	if (block >= MS912X_MAX_EDID_BLOCKS || len > EDID_LENGTH) {
+		memset(buf, 0xff, len);
+		return 0;
+	}
 
 	for (i = 0; i < len; i++) {
 		u16 address = MS912X_REG_EDID_BASE + offset + i;

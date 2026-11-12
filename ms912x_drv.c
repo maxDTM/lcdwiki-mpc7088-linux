@@ -2,6 +2,10 @@
 
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/list.h>
+#include <linux/notifier.h>
+#include <linux/slab.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/module.h>
@@ -56,9 +60,6 @@ static bool ms912x_needs_boot_delay(struct usb_interface *interface)
 	       0x345f;
 }
 
-/* jiffies of the last recovery reset (module-wide, survives the re-probe) */
-static unsigned long ms912x_last_reset;
-
 /*
  * Integrated-panel units boot their own firmware right after power-up.
  * Commands sent in that window leave the panel output dead (LED red) until
@@ -86,54 +87,139 @@ MODULE_PARM_DESC(full_range,
  * the DRM device is torn down and recreated cleanly and the compositor sees a
  * plain hotplug. (Parking/restoring the display with the suspend/resume
  * helpers is unsafe here: userspace keeps committing during the reset.)
+ *
+ * Limits: at most one reset per MS912X_RESET_INTERVAL_MS, and no more than
+ * MS912X_MAX_RESETS within MS912X_RESET_WINDOW_MS, so a dead chip cannot cause
+ * a reset loop. The re-probe frees the DRM device, so this state lives on the
+ * usb_device instead (devres): it survives our own resets, is per physical
+ * device, and starts fresh when the display is plugged in again.
  */
+struct ms912x_reset_state {
+	struct list_head node;
+	struct usb_device *usbdev;	/* key only, never dereferenced */
+	spinlock_t lock;
+	unsigned long last_reset;	/* 0 = never */
+	unsigned long window_start;	/* 0 = no window yet */
+	unsigned int resets_in_window;
+	unsigned long requested;	/* 0 = no reset pending */
+};
+
 /*
- * Module-wide limits (a reset re-probes the device, so per-device state would
- * not survive it): at most one reset per MS912X_RESET_INTERVAL_MS, and stop
- * after MS912X_MAX_RESETS within MS912X_RESET_WINDOW_MS so a dead chip
- * cannot cause a reset loop.
+ * One entry per USB device seen; freed when the USB device goes away (notifier
+ * below) or the module is unloaded. Interfaces are unbound before the device
+ * is removed, and ms912x_schedule_recovery only touches the state inside
+ * drm_dev_enter, so a disconnected ms912x never uses a freed entry.
  */
-static DEFINE_SPINLOCK(ms912x_reset_lock);
-static unsigned long ms912x_window_start;
-static unsigned int ms912x_resets_in_window;
+static LIST_HEAD(ms912x_reset_states);
+static DEFINE_MUTEX(ms912x_reset_state_mutex);
+
+static struct ms912x_reset_state *
+ms912x_get_reset_state(struct usb_device *usbdev)
+{
+	struct ms912x_reset_state *state;
+
+	mutex_lock(&ms912x_reset_state_mutex);
+	list_for_each_entry(state, &ms912x_reset_states, node)
+		if (state->usbdev == usbdev)
+			goto out;
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (state) {
+		state->usbdev = usbdev;
+		spin_lock_init(&state->lock);
+		list_add(&state->node, &ms912x_reset_states);
+	}
+out:
+	mutex_unlock(&ms912x_reset_state_mutex);
+	return state;
+}
+
+static int ms912x_usb_notify(struct notifier_block *nb, unsigned long action,
+			     void *data)
+{
+	struct ms912x_reset_state *state, *tmp;
+
+	if (action != USB_DEVICE_REMOVE)
+		return NOTIFY_DONE;
+
+	mutex_lock(&ms912x_reset_state_mutex);
+	list_for_each_entry_safe(state, tmp, &ms912x_reset_states, node) {
+		if (state->usbdev == data) {
+			list_del(&state->node);
+			kfree(state);
+		}
+	}
+	mutex_unlock(&ms912x_reset_state_mutex);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block ms912x_usb_nb = {
+	.notifier_call = ms912x_usb_notify,
+};
+
+/* jiffies stamps use 0 as "unset" */
+static unsigned long ms912x_stamp(unsigned long now)
+{
+	return now ? now : 1;
+}
 
 void ms912x_schedule_recovery(struct ms912x_device *ms912x, const char *why)
 {
-	unsigned long now = jiffies;
+	struct ms912x_reset_state *state = ms912x->reset_state;
+	unsigned long now = jiffies, next = 0;
+	unsigned long interval = msecs_to_jiffies(MS912X_RESET_INTERVAL_MS);
+	unsigned long window = msecs_to_jiffies(MS912X_RESET_WINDOW_MS);
 	bool do_reset = false;
+	int idx;
 
-	/* One request per device at a time; expires in case the reset never ran */
-	if (ms912x->recovery_requested &&
-	    time_before(now, ms912x->recovery_requested +
-				     msecs_to_jiffies(MS912X_RECOVERY_PENDING_MS)))
+	if (!state)
 		return;
-	ms912x->recovery_requested = now ? now : 1;
+	/*
+	 * Nothing to recover once the device is gone. This also keeps @state
+	 * valid: it is freed only after the device, and so this DRM device,
+	 * has been unplugged.
+	 */
+	if (!drm_dev_enter(&ms912x->drm, &idx))
+		return;
 
-	spin_lock(&ms912x_reset_lock);
-	if (!ms912x_window_start ||
-	    time_after(now, ms912x_window_start +
-				    msecs_to_jiffies(MS912X_RESET_WINDOW_MS))) {
-		ms912x_window_start = now;
-		ms912x_resets_in_window = 0;
+	spin_lock(&state->lock);
+	/* One request at a time; expires in case the reset never ran */
+	if (state->requested &&
+	    time_before(now, state->requested +
+			     msecs_to_jiffies(MS912X_RECOVERY_PENDING_MS))) {
+		spin_unlock(&state->lock);
+		goto out;
 	}
-	if ((!ms912x_last_reset ||
-	     time_after(now, ms912x_last_reset +
-				     msecs_to_jiffies(MS912X_RESET_INTERVAL_MS))) &&
-	    ms912x_resets_in_window < MS912X_MAX_RESETS) {
-		ms912x_last_reset = now;
-		ms912x_resets_in_window++;
+	if (!state->window_start ||
+	    time_after(now, state->window_start + window)) {
+		state->window_start = ms912x_stamp(now);
+		state->resets_in_window = 0;
+	}
+	if (state->last_reset && time_before(now, state->last_reset + interval))
+		next = state->last_reset + interval;
+	if (state->resets_in_window >= MS912X_MAX_RESETS &&
+	    (!next || time_after(state->window_start + window, next)))
+		next = state->window_start + window;
+	if (!next) {
+		state->last_reset = ms912x_stamp(now);
+		state->requested = state->last_reset;
+		state->resets_in_window++;
 		do_reset = true;
 	}
-	spin_unlock(&ms912x_reset_lock);
+	spin_unlock(&state->lock);
 
 	if (!do_reset) {
-		drm_err_once(&ms912x->drm,
-			     "%s; reset limit reached, replug the display\n", why);
-		return;
+		/* Don't block every commit on a dead device until a reset is allowed */
+		WRITE_ONCE(ms912x->drop_until, ms912x_stamp(next));
+		drm_err_ratelimited(&ms912x->drm,
+				    "%s; reset limit reached, dropping frames for %u s (replug the display to recover now)\n",
+				    why, jiffies_to_msecs(next - now) / 1000);
+		goto out;
 	}
 
 	drm_warn(&ms912x->drm, "%s, resetting device\n", why);
 	usb_queue_reset_device(ms912x->intf);
+out:
+	drm_dev_exit(idx);
 }
 
 /* The device lost power (or was reset) while suspended: chip rebooted. */
@@ -147,19 +233,22 @@ static int ms912x_usb_reset_resume(struct usb_interface *interface)
 
 DEFINE_DRM_GEM_FOPS(ms912x_driver_fops);
 
-static struct drm_driver ms912x_drm_driver = {
-	.driver_features = DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
+#define MS912X_DRM_DRIVER(drv_name)					\
+	{								\
+		.driver_features = DRIVER_ATOMIC | DRIVER_GEM |		\
+				   DRIVER_MODESET,			\
+		.fops = &ms912x_driver_fops,				\
+		DRM_GEM_SHMEM_DRIVER_OPS,				\
+		DRM_FBDEV_SHMEM_DRIVER_OPS,				\
+		.name = drv_name,					\
+		.desc = DRIVER_DESC,					\
+		.major = DRIVER_MAJOR,					\
+		.minor = DRIVER_MINOR,					\
+	}
 
-	/* GEM hooks */
-	.fops = &ms912x_driver_fops,
-	DRM_GEM_SHMEM_DRIVER_OPS,
-	DRM_FBDEV_SHMEM_DRIVER_OPS,
-
-	.name = DRIVER_NAME,
-	.desc = DRIVER_DESC,
-	.major = DRIVER_MAJOR,
-	.minor = DRIVER_MINOR,
-};
+static const struct drm_driver ms912x_drm_driver = MS912X_DRM_DRIVER(DRIVER_NAME);
+/* Same driver under DisplayLink's name, see aq_evdi_compat below */
+static const struct drm_driver ms912x_drm_driver_evdi = MS912X_DRM_DRIVER("evdi");
 
 static const struct drm_mode_config_funcs ms912x_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create_with_dirty,
@@ -244,6 +333,10 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
 	const struct ms912x_mode *ms_mode;
 	int ret;
 
+	/* Device failing and no reset allowed yet: don't stall on timeouts */
+	if (ms912x_dropping_frames(ms912x))
+		return;
+
 	ret = ms912x_power_on(ms912x);
 	if (ret) {
 		drm_err(dev, "failed to power on display: %d\n", ret);
@@ -298,6 +391,9 @@ ms912x_crtc_mode_valid(struct drm_crtc *crtc,
 
 	if (!ms_mode)
 		return MODE_BAD;
+	/* Pixels go out in UYVY pairs */
+	if (mode->hdisplay & 1)
+		return MODE_BAD_HVALUE;
 
 	return MODE_OK;
 }
@@ -308,6 +404,8 @@ static int ms912x_plane_atomic_check(struct drm_plane *plane,
 	struct drm_plane_state *old_plane_state;
 	struct drm_plane_state *new_plane_state;
 	struct drm_crtc_state *crtc_state = NULL;
+	struct drm_framebuffer *old_fb, *new_fb;
+	int ret;
 
 	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
 	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
@@ -315,18 +413,37 @@ static int ms912x_plane_atomic_check(struct drm_plane *plane,
 		crtc_state = drm_atomic_get_new_crtc_state(state,
 							   new_plane_state->crtc);
 
+	old_fb = old_plane_state->fb;
+	new_fb = new_plane_state->fb;
+
 	/*
-	 * A mode set does change how the device interprets the framebuffer
-	 * so ask for a full plane update for the first frame after one.
+	 * Damage clips describe what changed since the previous commit even
+	 * across a page flip, and the device keeps the previous frame, so only
+	 * repaint everything after a mode set or when the framebuffer size
+	 * changes. (Ignoring clips on every flip would upload a full frame for
+	 * every flip of a double-buffered compositor.)
 	 */
 	new_plane_state->ignore_damage_clips =
-		old_plane_state->fb != new_plane_state->fb ||
-		(crtc_state && drm_atomic_crtc_needs_modeset(crtc_state));
+		(crtc_state && drm_atomic_crtc_needs_modeset(crtc_state)) ||
+		!old_fb || !new_fb || old_fb->width != new_fb->width ||
+		old_fb->height != new_fb->height;
 
-	return drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
-						   DRM_PLANE_NO_SCALING,
-						   DRM_PLANE_NO_SCALING,
-						   false, false);
+	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  false, false);
+	if (ret || !new_plane_state->visible)
+		return ret;
+
+	/*
+	 * The device shows framebuffer pixel (x, y) at screen (x, y): the
+	 * visible source (after clipping to the CRTC) must start at the
+	 * framebuffer origin.
+	 */
+	if (new_plane_state->src.x1 || new_plane_state->src.y1)
+		return -EINVAL;
+
+	return 0;
 }
 
 static void ms912x_clear_rect(struct drm_rect *rect)
@@ -365,8 +482,9 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
 						       new_plane_state->crtc);
 	shadow_plane_state = to_drm_shadow_plane_state(new_plane_state);
 
-	/* Damage from the previous mode may not fit the new framebuffer. */
-	if (drm_atomic_crtc_needs_modeset(new_crtc_state))
+	/* Damage from the previous mode or framebuffer may not fit this one. */
+	if (drm_atomic_crtc_needs_modeset(new_crtc_state) ||
+	    new_plane_state->ignore_damage_clips)
 		ms912x_clear_rect(&ms912x->update_rect);
 
 	if (drm_atomic_helper_damage_merged(old_plane_state, new_plane_state,
@@ -427,6 +545,26 @@ static const u8 ms912x_bulk_out_endpoints[] = {
 };
 
 /*
+ * The chip takes its register requests as HID feature reports on the HID
+ * interface (0 on known units), not on the vendor interface this driver
+ * binds to.
+ */
+static u16 ms912x_find_ctrl_interface(struct usb_device *usbdev)
+{
+	struct usb_host_config *config = usbdev->actconfig;
+	unsigned int i;
+
+	for (i = 0; config && i < config->desc.bNumInterfaces; i++) {
+		struct usb_interface *intf = config->interface[i];
+
+		if (intf && intf->cur_altsetting->desc.bInterfaceClass ==
+				    USB_CLASS_HID)
+			return intf->cur_altsetting->desc.bInterfaceNumber;
+	}
+	return 0;
+}
+
+/*
  * Wayland compositors built on aquamarine (Hyprland) only accept render-less
  * KMS devices when the DRM driver is DisplayLink's "evdi"; any other name makes
  * them try to create an EGL renderer on the device, fail, and never light the
@@ -449,15 +587,19 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 	bool is_panel;
 	int port;
 
-	if (aq_evdi_compat)
-		ms912x_drm_driver.name = "evdi";
-
-	ms912x = devm_drm_dev_alloc(&interface->dev, &ms912x_drm_driver,
+	ms912x = devm_drm_dev_alloc(&interface->dev,
+				    aq_evdi_compat ? &ms912x_drm_driver_evdi :
+						     &ms912x_drm_driver,
 				    struct ms912x_device, drm);
 	if (IS_ERR(ms912x))
 		return PTR_ERR(ms912x);
 
 	ms912x->intf = interface;
+	usbdev = interface_to_usbdev(interface);
+	ms912x->ctrl_ifnum = ms912x_find_ctrl_interface(usbdev);
+	ms912x->reset_state = ms912x_get_reset_state(usbdev);
+	if (!ms912x->reset_state)
+		drm_warn(&ms912x->drm, "no memory for reset state, recovery disabled\n");
 	ret = devm_mutex_init(&interface->dev, &ms912x->ctrl_lock);
 	if (ret)
 		return ret;
@@ -467,9 +609,15 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 
 	{
 		/* A recovery reset may reboot the chip too: wait from whichever is later */
-		unsigned long since = interface_to_usbdev(interface)->connect_time;
-		unsigned long reset = READ_ONCE(ms912x_last_reset);
+		unsigned long since = usbdev->connect_time;
+		unsigned long reset = 0;
 
+		if (ms912x->reset_state) {
+			spin_lock(&ms912x->reset_state->lock);
+			reset = ms912x->reset_state->last_reset;
+			ms912x->reset_state->requested = 0;
+			spin_unlock(&ms912x->reset_state->lock);
+		}
 		if (reset && time_after(reset, since))
 			since = reset;
 		ms912x_wait_for_boot(interface, since);
@@ -511,7 +659,6 @@ static int ms912x_usb_probe(struct usb_interface *interface,
 			 mode->width, mode->height, mode->hz, mode->mode);
 	}
 
-	usbdev = interface_to_usbdev(interface);
 	ms912x->bulk_pipe =
 		usb_sndbulkpipe(usbdev, MS912X_BULK_OUT_ENDPOINT);
 	dev = &ms912x->drm;
@@ -645,7 +792,33 @@ static struct usb_driver ms912x_driver = {
 	.reset_resume = ms912x_usb_reset_resume,
 	.shutdown = ms912x_usb_shutdown,
 	.id_table = id_table,
+	/* Probe can wait seconds for the chip to boot: keep it off the hub thread */
+	.driver.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 };
-module_usb_driver(ms912x_driver);
+static int __init ms912x_init(void)
+{
+	int ret;
+
+	usb_register_notify(&ms912x_usb_nb);
+	ret = usb_register(&ms912x_driver);
+	if (ret)
+		usb_unregister_notify(&ms912x_usb_nb);
+	return ret;
+}
+
+static void __exit ms912x_exit(void)
+{
+	struct ms912x_reset_state *state, *tmp;
+
+	usb_deregister(&ms912x_driver);
+	usb_unregister_notify(&ms912x_usb_nb);
+	list_for_each_entry_safe(state, tmp, &ms912x_reset_states, node) {
+		list_del(&state->node);
+		kfree(state);
+	}
+}
+
+module_init(ms912x_init);
+module_exit(ms912x_exit);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
